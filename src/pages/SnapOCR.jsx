@@ -1,10 +1,10 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import GlassCard from '../components/GlassCard';
 import { vibrate, speak, stop } from '../lib/haptics';
 import { wordToVibration } from '../lib/braille';
 import useStore from '../store/useStore';
-import { Camera, ScanText, Play, Square, Loader2, AlertTriangle, RotateCcw } from 'lucide-react';
+import { Camera, Upload, ScanText, Play, Square, Loader2, AlertTriangle, RotateCcw, Copy } from 'lucide-react';
 
 const containerVariants = {
     hidden: { opacity: 0 },
@@ -19,293 +19,93 @@ const itemVariants = {
     show: { opacity: 1, scale: 1, transition: { type: 'spring', stiffness: 300, damping: 24 } }
 };
 
-// ── Memory-safe canvas preprocessing ────────────────────────
-function preprocessImage(blobOrUrl) {
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-            try {
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                if (!ctx) return reject(new Error('Canvas 2D context unavailable'));
-
-                // Memory-safe scaling — fit within 1600px on longest side
-                let w = img.width;
-                let h = img.height;
-                const longest = Math.max(w, h);
-                if (longest > 2000) {
-                    const scale = 1600 / longest;
-                    w = Math.round(w * scale);
-                    h = Math.round(h * scale);
-                }
-                canvas.width = w;
-                canvas.height = h;
-                ctx.drawImage(img, 0, 0, w, h);
-
-                const imageData = ctx.getImageData(0, 0, w, h);
-                const pixels = imageData.data;
-
-                // Grayscale
-                for (let i = 0; i < pixels.length; i += 4) {
-                    const gray = Math.round(
-                        0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2]
-                    );
-                    pixels[i] = gray;
-                    pixels[i + 1] = gray;
-                    pixels[i + 2] = gray;
-                }
-
-                // Contrast stretch
-                let min = 255;
-                let max = 0;
-                for (let i = 0; i < pixels.length; i += 4) {
-                    const v = pixels[i];
-                    if (v < min) min = v;
-                    if (v > max) max = v;
-                }
-                const range = max - min || 1;
-                for (let i = 0; i < pixels.length; i += 4) {
-                    const stretched = Math.round(((pixels[i] - min) / range) * 255);
-                    const clamped = Math.max(0, Math.min(255, stretched));
-                    pixels[i] = clamped;
-                    pixels[i + 1] = clamped;
-                    pixels[i + 2] = clamped;
-                }
-
-                // Binarize — threshold at 128
-                for (let i = 0; i < pixels.length; i += 4) {
-                    const bw = pixels[i] > 128 ? 255 : 0;
-                    pixels[i] = bw;
-                    pixels[i + 1] = bw;
-                    pixels[i + 2] = bw;
-                }
-
-                ctx.putImageData(imageData, 0, 0);
-
-                // Promisified toBlob
-                const getProcessedBlob = (c) =>
-                    new Promise((res) => {
-                        c.toBlob((blob) => res(blob), 'image/png', 1.0);
-                    });
-
-                getProcessedBlob(canvas).then((blob) => {
-                    const processedPreview = canvas.toDataURL('image/png');
-                    resolve({ blob, previewUrl: processedPreview });
-                });
-            } catch (err) {
-                reject(err);
-            }
-        };
-        img.onerror = () => reject(new Error('Failed to load image for preprocessing'));
-        // Accept both blob URLs and data URLs
-        if (blobOrUrl instanceof Blob) {
-            img.src = URL.createObjectURL(blobOrUrl);
-        } else {
-            img.src = blobOrUrl;
-        }
-    });
-}
-
-// ── Post-processing for extracted text ──────────────────────
-function cleanOcrText(raw) {
-    let text = raw;
-    text = text.replace(/[^a-zA-Z0-9\s.,!?'"():;\-/]/g, '');
-    text = text.replace(/\s+/g, ' ');
-    text = text.replace(/\n{3,}/g, '\n\n');
-    return text.trim();
-}
-
-// ── Confidence badge ────────────────────────────────────────
-function ConfidenceBadge({ confidence }) {
-    let color, bg, label;
-    if (confidence > 70) {
-        color = '#00d9a3';
-        bg = 'rgba(0, 217, 163, 0.12)';
-        label = 'High confidence';
-    } else if (confidence >= 40) {
-        color = '#f0a500';
-        bg = 'rgba(240, 165, 0, 0.12)';
-        label = 'Medium confidence — retake in better lighting';
-    } else {
-        color = '#ff4757';
-        bg = 'rgba(255, 71, 87, 0.12)';
-        label = 'Low confidence — try better lighting or a flatter angle';
-    }
-    return (
-        <div
-            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-dm font-medium mt-4"
-            style={{ background: bg, color, border: `1px solid ${color}33` }}
-        >
-            <span className="w-2 h-2 rounded-full inline-block" style={{ background: color }} />
-            {label} ({Math.round(confidence)}%)
-        </div>
-    );
-}
-
 export default function SnapOCR() {
-    // Preview URL from createObjectURL (for display only)
-    const [previewUrl, setPreviewUrl] = useState(null);
-    // Actual File object kept for passing to preprocessor/tesseract
+    const [mode, setMode] = useState(null);
     const [capturedFile, setCapturedFile] = useState(null);
-    const [processedSrc, setProcessedSrc] = useState(null);
+    const [previewUrl, setPreviewUrl] = useState(null);
+    const [extractedText, setExtractedText] = useState('');
     const [isScanning, setIsScanning] = useState(false);
-    const [scanProgress, setScanProgress] = useState(0);
-    const [isPlaying, setIsPlaying] = useState(false);
-    const [playIndex, setPlayIndex] = useState(0);
-    const [totalWords, setTotalWords] = useState(0);
-    const [scanError, setScanError] = useState(null);
+    const [progress, setProgress] = useState(0);
+    const [confidence, setConfidence] = useState(null);
+    const [error, setError] = useState(null);
+    const [isReading, setIsReading] = useState(false);
 
-    // (1) Camera input ref
     const cameraInputRef = useRef(null);
+    const uploadInputRef = useRef(null);
     const playIntervalRef = useRef(null);
-    // (4) Worker ref for cleanup on unmount
-    const workerRef = useRef(null);
-
     const logPractice = useStore((s) => s.logPractice);
 
-    // Persist OCR results in zustand so remounts don't lose data
-    const ocrText = useStore((s) => s._ocrText || '');
-    const confidence = useStore((s) => s._ocrConfidence ?? null);
-    const setOcrText = (text) => useStore.setState({ _ocrText: text });
-    const setConfidence = (val) => useStore.setState({ _ocrConfidence: val });
-
-    // (3) Revoke previous blob URL when a new one is created
     useEffect(() => {
         return () => {
-            if (previewUrl) URL.revokeObjectURL(previewUrl);
-        };
-    }, [previewUrl]);
+            if (previewUrl) URL.revokeObjectURL(previewUrl)
+        }
+    }, [previewUrl])
 
-    // (4) Terminate worker on unmount (AnimatePresence exit safety)
+    // Also stop reading when unmounting
     useEffect(() => {
         return () => {
-            if (workerRef.current) {
-                workerRef.current.terminate();
-                workerRef.current = null;
-            }
-        };
+            stop();
+            if (window.speechSynthesis) window.speechSynthesis.cancel();
+            if (playIntervalRef.current) clearTimeout(playIntervalRef.current);
+        }
     }, []);
 
-    // (2) Safe handleCapture — validates type, size, resets input
-    const handleCapture = useCallback((e) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
+    const handleFileSelected = (e) => {
+        const file = e.target.files?.[0]
+        if (!file) return
         if (!file.type.startsWith('image/')) {
-            setScanError('Please select an image file');
-            return;
+            setError('Please select an image file')
+            return
         }
-        const maxBytes = 15 * 1024 * 1024;
-        if (file.size > maxBytes) {
-            setScanError('Image too large. Please use a smaller photo.');
-            return;
+        if (file.size > 20 * 1024 * 1024) {
+            setError('Image too large. Please use an image under 20MB.')
+            return
         }
-        setScanError(null);
-        setOcrText('');
+        setError(null)
+        setExtractedText('')
+        setConfidence(null)
+        setProgress(0)
+        const url = URL.createObjectURL(file)
+        setPreviewUrl(url)
+        setCapturedFile(file)
+        e.target.value = ''
+    }
+
+    const handleReset = () => {
+        setCapturedFile(null);
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        setPreviewUrl(null);
+        setExtractedText('');
         setConfidence(null);
-        setProcessedSrc(null);
-        const url = URL.createObjectURL(file);
-        setPreviewUrl(url);
-        setCapturedFile(file);
-        // Reset so the same file can be re-selected
-        e.target.value = '';
-    }, []);
+        setProgress(0);
+        setError(null);
+        setIsReading(false);
+        stop();
+        if (window.speechSynthesis) window.speechSynthesis.cancel();
+        if (playIntervalRef.current) clearTimeout(playIntervalRef.current);
+    };
 
-    const handleScan = useCallback(async () => {
-        if (!capturedFile || isScanning) return;
-        setIsScanning(true);
-        setScanProgress(0);
-        setScanError(null);
-
-        try {
-            // Preprocess — wrapped in full try/catch
-            let processedBlob = null;
-            try {
-                const result = await preprocessImage(capturedFile);
-                if (result.blob) {
-                    processedBlob = result.blob;
-                    setProcessedSrc(result.previewUrl);
-                }
-            } catch (preprocessErr) {
-                console.warn('Preprocessing failed, falling back to raw image:', preprocessErr);
-            }
-
-            // (5) Create worker with throttled progress logger
-            let lastProgressUpdate = 0;
-            const { createWorker } = await import('tesseract.js');
-            const worker = await createWorker('eng', 1, {
-                logger: (m) => {
-                    if (m.status === 'recognizing text') {
-                        const now = Date.now();
-                        if (now - lastProgressUpdate > 200) {
-                            setScanProgress(Math.floor(m.progress * 100));
-                            lastProgressUpdate = now;
-                        }
-                    }
-                },
-            });
-
-            // Store in ref for unmount cleanup
-            workerRef.current = worker;
-
-            // Set accuracy params
-            await worker.setParameters({
-                tessedit_char_whitelist:
-                    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?\'"\\-:;()/ ',
-                tessedit_pageseg_mode: '6',
-                preserve_interword_spaces: '1',
-            });
-
-            // Pass preprocessed blob, or fall back to raw file
-            const ocrInput = processedBlob || capturedFile;
-            const { data } = await worker.recognize(ocrInput);
-
-            const cleaned = cleanOcrText(data.text);
-            setOcrText(cleaned || 'No readable text found. Try better lighting or a flatter angle.');
-            setConfidence(data.confidence);
-            // Final progress
-            setScanProgress(100);
-        } catch (err) {
-            console.error('OCR error:', err);
-            setScanError(
-                `Scan failed: ${err.message || 'Unknown error'}. Try better lighting or a smaller image.`
-            );
-            setOcrText('');
-            setConfidence(null);
-        } finally {
-            // Always terminate worker in finally
-            if (workerRef.current) {
-                try {
-                    await workerRef.current.terminate();
-                } catch (_) {
-                    /* swallow */
-                }
-                workerRef.current = null;
-            }
-            setIsScanning(false);
-        }
-    }, [capturedFile, isScanning]);
+    const handleScanAgain = () => {
+        handleReset();
+        setMode(null);
+    };
 
     const handleReadAndFeel = useCallback(() => {
-        if (!ocrText || isPlaying) return;
-        const words = ocrText.split(/\s+/).filter(Boolean);
+        if (!extractedText || isReading) return;
+        const words = extractedText.split(/\s+/).filter(Boolean);
         if (words.length === 0) return;
 
-        setIsPlaying(true);
-        setPlayIndex(0);
-        setTotalWords(words.length);
-
+        setIsReading(true);
         let index = 0;
 
         const playNext = () => {
             if (index >= words.length) {
-                setIsPlaying(false);
+                setIsReading(false);
                 stop();
                 return;
             }
 
             const word = words[index].toLowerCase().replace(/[^a-z0-9\s]/g, '');
-            setPlayIndex(index + 1);
 
             if (word) {
                 speak(word);
@@ -319,37 +119,182 @@ export default function SnapOCR() {
         };
 
         playNext();
-    }, [ocrText, isPlaying, logPractice]);
+    }, [extractedText, isReading, logPractice]);
 
-    const handleStop = useCallback(() => {
-        setIsPlaying(false);
+    const handleStopReading = useCallback(() => {
+        setIsReading(false);
         stop();
         if (window.speechSynthesis) window.speechSynthesis.cancel();
         if (playIntervalRef.current) clearTimeout(playIntervalRef.current);
     }, []);
 
-    const handleReset = useCallback(() => {
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        setPreviewUrl(null);
-        setCapturedFile(null);
-        setProcessedSrc(null);
-        setOcrText('');
-        setConfidence(null);
-        setScanError(null);
-        setScanProgress(0);
-        handleStop();
-    }, [handleStop, previewUrl]);
+    const handleCopy = () => {
+        navigator.clipboard.writeText(extractedText);
+    };
 
-    // Show processed B&W preview if available, otherwise original
-    const displaySrc = processedSrc || previewUrl;
+    const scanImage = async () => {
+        if (!capturedFile || isScanning) return
+        setIsScanning(true)
+        setProgress(0)
+        setError(null)
+        setExtractedText('')
+
+        try {
+            // STEP 1: Load image onto offscreen canvas
+            const img = await new Promise((resolve, reject) => {
+                const i = new Image()
+                i.onload = () => resolve(i)
+                i.onerror = reject
+                i.src = URL.createObjectURL(capturedFile)
+            })
+
+            const canvas = document.createElement('canvas')
+
+            // STEP 2: Scale up small images — tesseract works best at 300 DPI equivalent
+            // Minimum 2000px on longest side for best accuracy
+            let w = img.naturalWidth
+            let h = img.naturalHeight
+            const minSize = 2000
+            const maxSize = 3000
+            if (w < minSize || h < minSize) {
+                const scale = Math.min(minSize / w, minSize / h)
+                w = Math.floor(w * scale)
+                h = Math.floor(h * scale)
+            }
+            if (w > maxSize || h > maxSize) {
+                const scale = Math.min(maxSize / w, maxSize / h)
+                w = Math.floor(w * scale)
+                h = Math.floor(h * scale)
+            }
+            canvas.width = w
+            canvas.height = h
+            const ctx = canvas.getContext('2d')
+
+            // STEP 3: Draw with white background (prevents dark background ruining binarization)
+            ctx.fillStyle = '#ffffff'
+            ctx.fillRect(0, 0, w, h)
+            ctx.drawImage(img, 0, 0, w, h)
+            setProgress(15)
+
+            // STEP 4: Grayscale
+            const imageData = ctx.getImageData(0, 0, w, h)
+            const data = imageData.data
+            for (let i = 0; i < data.length; i += 4) {
+                const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2])
+                data[i] = data[i + 1] = data[i + 2] = gray
+            }
+            setProgress(30)
+
+            // STEP 5: Find min/max for contrast stretching
+            let min = 255, max = 0
+            for (let i = 0; i < data.length; i += 4) {
+                if (data[i] < min) min = data[i]
+                if (data[i] > max) max = data[i]
+            }
+            const range = max - min || 1
+
+            // STEP 6: Contrast stretch + sharpen
+            for (let i = 0; i < data.length; i += 4) {
+                const stretched = Math.round(((data[i] - min) / range) * 255)
+                data[i] = data[i + 1] = data[i + 2] = Math.min(255, Math.max(0, stretched))
+            }
+            setProgress(45)
+
+            // STEP 7: Adaptive-style binarization
+            // Use Otsu-inspired threshold instead of fixed 128
+            const histogram = new Array(256).fill(0)
+            for (let i = 0; i < data.length; i += 4) histogram[data[i]]++
+            const totalPixels = (data.length / 4)
+            let sum = 0
+            for (let i = 0; i < 256; i++) sum += i * histogram[i]
+            let sumB = 0, wB = 0, maxVariance = 0, threshold = 128
+            for (let t = 0; t < 256; t++) {
+                wB += histogram[t]
+                if (wB === 0) continue
+                const wF = totalPixels - wB
+                if (wF === 0) break
+                sumB += t * histogram[t]
+                const mB = sumB / wB
+                const mF = (sum - sumB) / wF
+                const variance = wB * wF * (mB - mF) ** 2
+                if (variance > maxVariance) { maxVariance = variance; threshold = t }
+            }
+
+            // Apply threshold
+            for (let i = 0; i < data.length; i += 4) {
+                const bw = data[i] > threshold ? 255 : 0
+                data[i] = data[i + 1] = data[i + 2] = bw
+            }
+            ctx.putImageData(imageData, 0, 0)
+            setProgress(60)
+
+            // STEP 8: Convert to blob
+            const blob = await new Promise((resolve) => canvas.toBlob((b) => resolve(b), 'image/png', 1.0))
+            if (!blob) throw new Error('Canvas processing failed')
+            setProgress(70)
+
+            // STEP 9: Run Tesseract with maximum accuracy settings
+            const { createWorker } = await import('tesseract.js');
+            const worker = await createWorker('eng', 1, {
+                logger: (m) => {
+                    if (m.status === 'recognizing text') {
+                        const tessProgress = Math.floor(m.progress * 25)
+                        setProgress(70 + tessProgress)
+                    }
+                }
+            })
+
+            await worker.setParameters({
+                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?\'"-:;()/ ',
+                tessedit_pageseg_mode: '6',
+                tessedit_ocr_engine_mode: '1',
+                preserve_interword_spaces: '1',
+                textord_heavy_nr: '1',
+                edges_max_children_per_outline: '40',
+            })
+
+            const { data: result } = await worker.recognize(blob)
+            await worker.terminate()
+            setProgress(98)
+
+            // STEP 10: Post-process text
+            const cleaned = result.text
+                .replace(/[^a-zA-Z0-9\s.,!?'"():;\-\/\n]/g, '')
+                .replace(/[ \t]{2,}/g, ' ')
+                .replace(/\n{3,}/g, '\n\n')
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0)
+                .join('\n')
+
+            if (!cleaned || cleaned.length < 2) {
+                throw new Error('No text found. Try better lighting or hold the camera steadier.')
+            }
+
+            setExtractedText(cleaned)
+            setConfidence(Math.floor(result.confidence))
+            setProgress(100)
+
+        } catch (err) {
+            setError(err.message || 'Scan failed. Try again with better lighting.')
+            setProgress(0)
+        } finally {
+            setIsScanning(false)
+        }
+    }
+
+    const getProgressLabel = () => {
+        if (progress <= 15) return "Loading image...";
+        if (progress <= 45) return "Enhancing image...";
+        if (progress <= 65) return "Optimizing contrast...";
+        if (progress <= 95) return "Reading text...";
+        return "Finishing up...";
+    };
+
+    const wordCount = extractedText ? extractedText.split(/\s+/).filter(Boolean).length : 0;
 
     return (
-        <motion.div
-            variants={containerVariants}
-            initial="hidden"
-            animate="show"
-            className="page-content px-4 pb-24"
-        >
+        <motion.div variants={containerVariants} initial="hidden" animate="show" className="page-content px-4 pb-24">
             <motion.div variants={itemVariants} className="mb-10 mt-6">
                 <h2 className="font-syne text-[2.5rem] tracking-tighter mb-2 leading-none text-white">
                     Snap & Read
@@ -359,159 +304,214 @@ export default function SnapOCR() {
                 </p>
             </motion.div>
 
-            {/* Camera Capture Section */}
-            {!previewUrl ? (
-                <motion.div variants={itemVariants} className="flex flex-col items-center justify-center py-12">
-                    <motion.button
-                        whileTap={{ scale: 0.85 }}
-                        transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-                        onClick={() => cameraInputRef.current?.click()}
-                        disabled={isScanning}
-                        className="relative w-36 h-36 rounded-full flex items-center justify-center bg-black border-[4px] border-[#6c63ff] outline-none disabled:opacity-50"
-                        style={{
-                            boxShadow:
-                                '0 0 60px rgba(108, 99, 255, 0.4), inset 0 0 20px rgba(108, 99, 255, 0.2)',
-                            WebkitTapHighlightColor: 'transparent',
-                        }}
+            {/* 1. TWO MODE SELECTION UI */}
+            {!mode && (
+                <motion.div variants={itemVariants} className="flex gap-4">
+                    <GlassCard
+                        className="flex-1 flex flex-col items-center justify-center p-6 cursor-pointer hover:bg-white/[0.08] transition-all"
+                        onClick={() => setMode('camera')}
                     >
-                        <div className="absolute inset-2 rounded-full border border-white/10" />
-                        <Camera size={44} style={{ color: '#EDEDED' }} />
-                    </motion.button>
-                    <p className="mt-8 text-xs tracking-widest uppercase font-dm text-[#555555]">
-                        Tap to Capture
-                    </p>
-                </motion.div>
-            ) : (
-                <motion.div variants={itemVariants} className="w-full">
-                    {/* Edge-to-edge Preview */}
-                    <div className="relative w-full aspect-[4/3] rounded-3xl overflow-hidden mb-6 bg-black border border-white/[0.05] shadow-2xl">
-                        <img
-                            src={displaySrc}
-                            alt="Captured"
-                            className="w-full h-full object-cover"
-                        />
-                        <div className="absolute inset-0 bg-gradient-to-b from-black/10 to-black/60 pointer-events-none" />
+                        <div className="w-14 h-14 rounded-full bg-white/[0.05] border border-white/10 flex items-center justify-center mb-4">
+                            <Camera size={28} className="text-white" />
+                        </div>
+                        <h3 className="font-syne text-lg text-white mb-1">Take Photo</h3>
+                        <p className="font-dm text-xs text-[#555555]">Use your camera</p>
+                    </GlassCard>
 
+                    <GlassCard
+                        className="flex-1 flex flex-col items-center justify-center p-6 cursor-pointer hover:bg-white/[0.08] transition-all"
+                        onClick={() => setMode('upload')}
+                    >
+                        <div className="w-14 h-14 rounded-full bg-white/[0.05] border border-white/10 flex items-center justify-center mb-4">
+                            <Upload size={28} className="text-white" />
+                        </div>
+                        <h3 className="font-syne text-lg text-white mb-1">Upload Image</h3>
+                        <p className="font-dm text-xs text-[#555555]">From your gallery</p>
+                    </GlassCard>
+                </motion.div>
+            )}
+
+            {/* CAPTURE / UPLOAD UI */}
+            {mode && !capturedFile && (
+                <motion.div variants={itemVariants}>
+                    {mode === 'camera' ? (
+                        <div className="flex flex-col items-center justify-center py-12">
+                            <motion.button
+                                whileTap={{ scale: 0.85 }}
+                                transition={{ type: 'spring', stiffness: 400, damping: 25 }}
+                                onClick={() => cameraInputRef.current?.click()}
+                                className="relative w-36 h-36 rounded-full flex items-center justify-center bg-black border-[4px] border-[#6c63ff] outline-none"
+                                style={{
+                                    boxShadow: '0 0 60px rgba(108, 99, 255, 0.4), inset 0 0 20px rgba(108, 99, 255, 0.2)',
+                                    WebkitTapHighlightColor: 'transparent',
+                                }}
+                            >
+                                <div className="absolute inset-2 rounded-full border border-white/10" />
+                                <Camera size={44} style={{ color: '#EDEDED' }} />
+                            </motion.button>
+                            <p className="mt-8 text-xs tracking-widest uppercase font-dm text-[#555555]">
+                                Tap to Capture
+                            </p>
+                            <input
+                                ref={cameraInputRef}
+                                type="file"
+                                accept="image/*"
+                                capture="environment"
+                                style={{ display: 'none' }}
+                                onChange={handleFileSelected}
+                            />
+                        </div>
+                    ) : (
+                        <GlassCard
+                            className="mb-6 cursor-pointer group"
+                            style={{
+                                border: '1px dashed rgba(255, 255, 255, 0.15)',
+                                textAlign: 'center',
+                                padding: '48px 20px',
+                            }}
+                            onClick={() => uploadInputRef.current?.click()}
+                            onDragOver={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                            }}
+                            onDrop={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                handleFileSelected({ target: { files: e.dataTransfer.files } });
+                            }}
+                        >
+                            <div className="w-16 h-16 rounded-full bg-white/[0.03] flex items-center justify-center mb-4 mx-auto group-hover:scale-110 transition-transform duration-300">
+                                <Upload size={32} style={{ color: '#EDEDED' }} />
+                            </div>
+                            <h3 className="font-syne text-lg text-white mb-2">Tap to browse or drag an image here</h3>
+                            <input
+                                ref={uploadInputRef}
+                                type="file"
+                                accept="image/*"
+                                style={{ display: 'none' }}
+                                onChange={handleFileSelected}
+                            />
+                        </GlassCard>
+                    )}
+
+                    <div className="mt-4 flex justify-center">
+                        <button onClick={() => setMode(null)} className="text-xs text-[#555555] underline hover:text-white transition-colors">
+                            Back to mode selection
+                        </button>
+                    </div>
+                </motion.div>
+            )}
+
+            {/* SCANNING & PREVIEW UI */}
+            {capturedFile && !extractedText && (
+                <motion.div variants={itemVariants} className="w-full">
+                    <GlassCard className="mb-6 p-4 flex flex-col items-center">
+                        <img
+                            src={previewUrl}
+                            alt="Preview"
+                            style={{ width: '100%', maxHeight: 220, objectFit: 'contain', borderRadius: 12 }}
+                        />
                         <button
                             onClick={handleReset}
+                            className="mt-4 text-xs font-dm text-[#555555] underline border border-white/10 px-3 py-1.5 rounded-lg hover:bg-white/5 transition-colors"
                             disabled={isScanning}
-                            className="absolute top-4 right-4 bg-black/60 backdrop-blur-md px-4 py-2 rounded-full text-xs font-dm text-white border border-white/10 disabled:opacity-50"
                         >
-                            Retake
+                            Change Image
                         </button>
+                    </GlassCard>
 
-                        {processedSrc && (
-                            <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-[10px] font-dm text-[#00d9a3] border border-[#00d9a3]/20">
-                                Preprocessed
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Scan Action */}
-                    {!ocrText && !scanError && (
+                    {!isScanning && !error && (
                         <motion.button
                             whileTap={{ scale: 0.95 }}
-                            transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-                            onClick={handleScan}
-                            disabled={isScanning}
-                            className="w-full py-4 rounded-2xl flex items-center justify-center gap-3 text-lg font-dm font-bold disabled:opacity-50"
+                            onClick={scanImage}
+                            className="w-full py-4 rounded-2xl flex items-center justify-center gap-3 text-lg font-dm font-bold"
                             style={{
                                 background: 'white',
                                 color: 'black',
                                 boxShadow: '0 8px 32px rgba(255,255,255,0.15)',
                             }}
                         >
-                            {isScanning ? (
-                                <>
-                                    <Loader2 size={20} className="animate-spin" />
-                                    Scanning... {scanProgress}%
-                                </>
-                            ) : (
-                                <>
-                                    <ScanText size={20} />
-                                    Process Text
-                                </>
-                            )}
+                            <ScanText size={20} />
+                            Process Text
                         </motion.button>
                     )}
 
-                    {/* Scan Progress Bar */}
                     {isScanning && (
-                        <div className="w-full h-1 bg-white/[0.05] rounded-full overflow-hidden mt-4">
-                            <motion.div
-                                className="h-full bg-[#EDEDED]"
-                                initial={{ width: 0 }}
-                                animate={{ width: `${scanProgress}%` }}
-                                transition={{ ease: 'linear' }}
-                            />
+                        <div className="mt-6">
+                            <div className="flex justify-between text-xs font-dm text-[#555555] mb-2 uppercase tracking-wide">
+                                <span>{getProgressLabel()}</span>
+                                <span>{progress}%</span>
+                            </div>
+                            <div className="w-full h-2 bg-white/[0.05] rounded-full overflow-hidden">
+                                <motion.div
+                                    className="h-full"
+                                    style={{ background: 'linear-gradient(90deg, #6c63ff, #00d9a3)' }}
+                                    initial={{ width: 0 }}
+                                    animate={{ width: `${progress}%` }}
+                                    transition={{ ease: 'linear', duration: 0.3 }}
+                                />
+                            </div>
                         </div>
                     )}
+
+                    {error && (
+                        <GlassCard className="mt-4 p-4 !bg-[#ff4757]/10 !border-[#ff4757]/20 flex flex-col items-center">
+                            <div className="flex items-start gap-3 mb-4">
+                                <AlertTriangle size={20} className="text-[#ff4757] mt-0.5" />
+                                <p className="font-dm text-sm text-[#ff4757] leading-relaxed">{error}</p>
+                            </div>
+                            <button
+                                onClick={() => { setError(null); setProgress(0); }}
+                                className="px-4 py-2 font-dm text-sm text-[#EDEDED] bg-white/5 border border-white/10 rounded-xl"
+                            >
+                                Try Again
+                            </button>
+                        </GlassCard>
+                    )}
+
                 </motion.div>
             )}
 
-            {/* (1) Hidden camera input — always in DOM */}
-            <input
-                ref={cameraInputRef}
-                type="file"
-                accept="image/*"
-                capture="environment"
-                className="hidden"
-                onChange={handleCapture}
-            />
-
-            {/* Error State */}
-            {scanError && (
-                <motion.div variants={itemVariants} className="mt-4">
-                    <GlassCard
-                        className="p-6"
-                        hover={false}
-                        style={{
-                            borderColor: 'rgba(255, 71, 87, 0.2)',
-                            background: 'rgba(255, 71, 87, 0.06)',
-                        }}
-                    >
-                        <div className="flex items-start gap-3 mb-4">
-                            <AlertTriangle
-                                size={20}
-                                className="flex-shrink-0 mt-0.5"
-                                style={{ color: '#ff4757' }}
-                            />
-                            <p className="font-dm text-sm text-[#ff4757] leading-relaxed">
-                                {scanError}
-                            </p>
-                        </div>
-                        <motion.button
-                            whileTap={{ scale: 0.95 }}
-                            transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-                            onClick={handleReset}
-                            className="w-full py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-dm font-bold bg-white/[0.05] border border-white/[0.08] text-[#EDEDED]"
-                        >
-                            <RotateCcw size={16} />
-                            Try Again
-                        </motion.button>
-                    </GlassCard>
-                </motion.div>
-            )}
-
-            {/* Extracted Text Details */}
-            {ocrText && (
+            {/* RESULTS UI */}
+            {extractedText && (
                 <motion.div variants={itemVariants} className="mt-2">
                     <GlassCard className="mb-6 p-6" hover={false}>
-                        <p className="text-xs font-dm mb-4 tracking-widest uppercase text-[#555555]">
-                            Extracted Text
-                        </p>
-                        <div className="font-dm text-base leading-relaxed text-[#EDEDED] max-h-[180px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-                            {ocrText}
+                        <div className="flex justify-between items-start mb-4">
+                            <p className="text-xs font-dm tracking-widest uppercase text-[#555555]">
+                                Extracted Text
+                            </p>
+                            <span className="text-xs font-dm text-[#555555]">
+                                {wordCount} words detected
+                            </span>
                         </div>
-                        {confidence !== null && <ConfidenceBadge confidence={confidence} />}
+
+                        <div className="font-dm text-base leading-[1.7] text-[#EDEDED] max-h-[180px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                            {extractedText}
+                        </div>
+
+                        {confidence !== null && (
+                            <div className="mt-4">
+                                {confidence > 80 ? (
+                                    <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-dm font-medium bg-[#00d9a3]/10 text-[#00d9a3] border border-[#00d9a3]/20">
+                                        <span className="w-2 h-2 rounded-full bg-[#00d9a3]" /> High Accuracy ({confidence}%)
+                                    </span>
+                                ) : confidence >= 60 ? (
+                                    <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-dm font-medium bg-[#f0a500]/10 text-[#f0a500] border border-[#f0a500]/20">
+                                        <span className="w-2 h-2 rounded-full bg-[#f0a500]" /> Good — try better lighting to improve ({confidence}%)
+                                    </span>
+                                ) : (
+                                    <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-dm font-medium bg-[#ff4757]/10 text-[#ff4757] border border-[#ff4757]/20">
+                                        <span className="w-2 h-2 rounded-full bg-[#ff4757]" /> Low — retake in brighter conditions ({confidence}%)
+                                    </span>
+                                )}
+                            </div>
+                        )}
                     </GlassCard>
 
-                    {/* Action Dock */}
-                    <div className="flex gap-3">
-                        {!isPlaying ? (
+                    <div className="flex gap-3 mb-4">
+                        {!isReading ? (
                             <motion.button
                                 whileTap={{ scale: 0.95 }}
-                                transition={{ type: 'spring', stiffness: 400, damping: 25 }}
                                 onClick={handleReadAndFeel}
                                 className="flex-1 py-4 rounded-2xl flex items-center justify-center gap-3 text-lg font-dm font-bold bg-white text-black shadow-[0_8px_32px_rgba(255,255,255,0.15)]"
                             >
@@ -521,8 +521,7 @@ export default function SnapOCR() {
                         ) : (
                             <motion.button
                                 whileTap={{ scale: 0.95 }}
-                                transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-                                onClick={handleStop}
+                                onClick={handleStopReading}
                                 className="flex-1 py-4 rounded-2xl flex items-center justify-center gap-3 text-lg font-dm font-bold bg-[#ff4757] text-white shadow-[0_8px_32px_rgba(255,71,87,0.25)]"
                             >
                                 <Square size={18} fill="currentColor" />
@@ -531,15 +530,26 @@ export default function SnapOCR() {
                         )}
                     </div>
 
-                    {isPlaying && (
-                        <motion.p
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            className="text-center text-xs font-dm mt-6 tracking-widest uppercase text-[#555555]"
+                    <div className="flex gap-3">
+                        <motion.button
+                            whileTap={{ scale: 0.95 }}
+                            onClick={handleCopy}
+                            className="flex-1 py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-dm font-medium bg-white/5 border border-white/10 text-white"
                         >
-                            Word {playIndex} of {totalWords}
-                        </motion.p>
-                    )}
+                            <Copy size={16} />
+                            Copy Text
+                        </motion.button>
+
+                        <motion.button
+                            whileTap={{ scale: 0.95 }}
+                            onClick={handleScanAgain}
+                            className="flex-1 py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-dm font-medium bg-white/5 border border-white/10 text-white"
+                        >
+                            <RotateCcw size={16} />
+                            Scan Again
+                        </motion.button>
+                    </div>
+
                 </motion.div>
             )}
         </motion.div>
